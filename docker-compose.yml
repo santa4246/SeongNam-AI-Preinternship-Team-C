@@ -1,0 +1,177 @@
+version: "3"
+
+volumes:
+  mongodb_data_dev: {}
+  postgres_data_dev: {}
+  elasticsearch:
+  grafana_volume:
+#    external: true
+
+services:
+
+  db:
+    image: postgres:12.0-alpine
+    container_name: postgres
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data/
+    environment:
+      POSTGRES_USER: "eg_user"
+      POSTGRES_PASSWORD: "eg_pw"
+      POSTGRES_DB: "eg_db"
+    ports:
+      - "5432:5432"
+
+  backend:
+    container_name: backend
+    build:
+      context: ./backend
+      args:
+        DJANGO_ALLOWED_HOSTS: "*"
+        DJANGO_SECRET_KEY: "*"
+        DJANGO_CORS_ORIGIN_WHITELIST: "*"
+    command: python manage.py runserver 0.0.0.0:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/:/backend/
+    expose:
+      - 8000
+    env_file:
+      - ./settings/dev/.env.dev
+    depends_on:
+      - db
+      - rabbitmq
+
+  rabbitmq:
+    container_name: rabbitmq
+    image: rabbitmq:3.7.14-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  celery:
+    container_name: celery
+    build:
+      context: ./backend
+      args:
+        DJANGO_ALLOWED_HOSTS: "*"
+        DJANGO_SECRET_KEY: "*"
+        DJANGO_CORS_ORIGIN_WHITELIST: "*"
+    working_dir: /backend/
+    command: celery -A backend worker -l info
+    volumes:
+      - ./backend/:/backend/
+    env_file:
+      - ./settings/dev/.env.dev
+    depends_on:
+      - backend
+
+  node-exporter:
+    container_name: node-exporter
+    image: prom/node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - --collector.filesystem.ignored-mount-points
+      - "^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)"
+    ports:
+      - "9100:9100"
+    restart: always
+    deploy:
+      mode: global
+
+  alertmanager:
+    container_name: alertmanager
+    image: prom/alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/:/etc/alertmanager/
+    restart: always
+    command:
+      - '--config.file=/etc/alertmanager/config.yml'
+      - '--storage.path=/alertmanager'
+
+  cadvisor:
+    container_name: cadvisor
+    image: google/cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /etc/machine-id:/etc/machine-id:ro #디렉토리 오류나서 추가
+    ports:
+      - "8080:8080"
+    restart: always
+    privileged: true #디렉토리 오류나서 추가
+    deploy:
+      mode: global
+      restart_policy:
+          condition: on-failure
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    links:
+      - cadvisor:cadvisor
+      - alertmanager:alertmanager
+    volumes:
+      - ./prometheus/:/etc/prometheus/
+      - ./prometheus/data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    user: "472"
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "8082:3000"
+    volumes:
+      - grafana_volume:/var/lib/grafana
+      - ./grafana/provisioning/:/etc/grafana/provisioning/
+    env_file:
+      - grafana/config.monitoring
+
+  elasticsearch:
+    container_name: elasticsearch
+    build:
+      context: elasticsearch/
+      args:
+        ELK_VERSION: 7.16.3
+    #    image: elasticsearch:7.16.3
+    restart: always
+    volumes:
+      - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro,z
+      - elasticsearch:/usr/share/elasticsearch/data:z
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      ES_JAVA_OPTS: "-Xmx256m -Xms256m"
+      ELASTIC_PASSWORD: j2h2
+      discovery.type: single-node
+
+  kibana:
+    container_name: kibana
+    image: kibana:7.16.3
+    volumes:
+      - ./kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml:ro,z
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
